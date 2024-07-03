@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 
 	"github.com/gnufied/cns-migration/pkg/cnsmigration"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	klog "k8s.io/klog/v2"
@@ -34,6 +33,8 @@ func main() {
 	}
 
 	// TODO: Do we need to accept datastore URL or just a name?
+	// Using a datastoreURL will guarantee unique name whereas a datastore name can be
+	// not-unique across datacenters.
 	destinationDatastore := flag.String("destination", "", "name of destination datastore")
 	sourceDatastore := flag.String("source", "", "name of source datastore")
 
@@ -61,12 +62,7 @@ func main() {
 		klog.Fatalf("error building kubeconfig: %v", err)
 	}
 
-	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		klog.Fatalf("error building kubernetes client: %v", err)
-	}
-	migrator := cnsmigration.NewCNSVolumeMigrator(clientset, *sourceDatastore, *destinationDatastore)
+	migrator := cnsmigration.NewCNSVolumeMigrator(config, *sourceDatastore, *destinationDatastore)
 
 	err = migrator.StartMigration()
 	if err != nil {
