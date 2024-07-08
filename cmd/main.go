@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -37,6 +38,7 @@ func main() {
 	// not-unique across datacenters.
 	destinationDatastore := flag.String("destination", "", "name of destination datastore")
 	sourceDatastore := flag.String("source", "", "name of source datastore")
+	volumeFile := flag.String("volume-file", "", "file from which we can read list of PVs to migrate")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -64,7 +66,7 @@ func main() {
 
 	migrator := cnsmigration.NewCNSVolumeMigrator(config, *sourceDatastore, *destinationDatastore)
 
-	err = migrator.StartMigration()
+	err = migrator.StartMigration(context.TODO(), *volumeFile)
 	if err != nil {
 		klog.Fatalf("error migration one or more volumes: %v", err)
 	}

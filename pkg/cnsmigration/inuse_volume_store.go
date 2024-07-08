@@ -100,9 +100,15 @@ func (s *inUseVolumeStore) removePodPVCWithHandle(vh volumeHandle, podName, pvcN
 	vsinfo.removePod(pvcName, podName)
 }
 
-func (s *inUseVolumeStore) addPod(pod *v1.Pod) {
+func (s *inUseVolumeStore) addAllPods(pods []v1.Pod) {
 	s.Lock()
 	defer s.Unlock()
+	for _, pod := range pods {
+		s.addPod(pod)
+	}
+}
+
+func (s *inUseVolumeStore) addPod(pod v1.Pod) {
 	if isPodTerminated(pod) {
 		return
 	}
@@ -149,7 +155,7 @@ func (s *inUseVolumeStore) volumeInUse(vh volumeHandle) (string, string, bool) {
 }
 
 // isPodTerminated checks if pod is terminated
-func isPodTerminated(pod *v1.Pod) bool {
+func isPodTerminated(pod v1.Pod) bool {
 	podStatus := pod.Status
 	return podStatus.Phase == v1.PodFailed || podStatus.Phase == v1.PodSucceeded
 }

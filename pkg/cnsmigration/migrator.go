@@ -3,6 +3,10 @@ package cnsmigration
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/gnufied/cns-migration/pkg/cnsmigration/vclib"
@@ -11,14 +15,13 @@ import (
 	"github.com/vmware/govmomi/cns/types"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25/soap"
 	vim "github.com/vmware/govmomi/vim25/types"
 	"gopkg.in/gcfg.v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/legacy-cloud-providers/vsphere"
 )
@@ -50,6 +53,7 @@ type CNSVolumeMigrator struct {
 
 	// for storing result and matches
 	matchingCnsVolumes []types.CnsVolume
+	usedVolumeCache    *inUseVolumeStore
 }
 
 func NewCNSVolumeMigrator(config *rest.Config, dsSource, dsTarget string) *CNSVolumeMigrator {
@@ -68,7 +72,7 @@ func (c *CNSVolumeMigrator) createOpenshiftClients() {
 	c.openshiftOperatorClientSet = operatorclient.NewForConfigOrDie(rest.AddUserAgent(c.kubeConfig, clientOperatorName))
 }
 
-func (c *CNSVolumeMigrator) StartMigration(ctx context.Context) error {
+func (c *CNSVolumeMigrator) StartMigration(ctx context.Context, volumeFile string) error {
 	// find existing CSI based persistent volumes, which same datastore as one mentioned in the source
 	c.createOpenshiftClients()
 
@@ -83,47 +87,122 @@ func (c *CNSVolumeMigrator) StartMigration(ctx context.Context) error {
 		klog.Errorf("error listing cns volumes: %v", err)
 		return err
 	}
-	informerFactory := informers.NewSharedInformerFactory(c.clientSet, resyncPeriod)
-
 	pvList, err := c.clientSet.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
 
-	usedVolumeCache := NewInUseStore(pvList.Items)
+	podList, err := c.clientSet.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
 
-	// TODO: setup event handler for pods and make sure we are doing the right thing
-
-	c.findCSIVolumes(ctx)
-
-	// find all persistnet volumes which are not attached to any node.
-	// group the persistent volumes by nodes
-	return nil
+	c.usedVolumeCache = NewInUseStore(pvList.Items)
+	c.usedVolumeCache.addAllPods(podList.Items)
+	return c.findCSIVolumes(ctx, volumeFile)
 }
 
-func (c *CNSVolumeMigrator) setupPodsUsingVolumes(ctx context.Context, informerFactory informers.SharedInformerFactory) error {
-	podInformer := informerFactory.Core().V1().Pods()
-	podInformer.Informer().AddEventHandlerWithResyncPeriod(cache.ResourceEventHandlerFuncs{
-		AddFunc:    nil,
-		UpdateFunc: nil,
-		DeleteFunc: nil,
-	}, resyncPeriod)
-	return nil
-}
+func (c *CNSVolumeMigrator) findCSIVolumes(ctx context.Context, volumeFile string) error {
+	file, err := os.Open(volumeFile)
+	if err != nil {
+		msg := fmt.Errorf("error opening file %s: %v", volumeFile, err)
+		klog.Error(msg)
+		return msg
+	}
+	defer file.Close()
 
-func (c *CNSVolumeMigrator) findCSIVolumes(ctx context.Context) ([]*v1.PersistentVolume, error) {
-	for _, pv := range pvList.Items {
-		fmt.Printf("name of pv is %s\n", pv.Name)
+	fileBytes, err := io.ReadAll(file)
+	if err != nil {
+		msg := fmt.Errorf("error reading file %s: %v", volumeFile, err)
+		klog.Error(msg)
+		return msg
+	}
+	if len(fileBytes) == 0 {
+		msg := fmt.Errorf("file %s has no listed volumes", volumeFile)
+		return msg
+	}
+
+	volumeLines := strings.Split(string(fileBytes), "\n")
+	for _, volumeLine := range volumeLines {
+		pvName := strings.TrimSpace(volumeLine)
+		if pvName == "" {
+			continue
+		}
+		pv, err := c.clientSet.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+		if err != nil {
+			msg := fmt.Errorf("error finding pv %s: %v", pvName, err)
+			klog.Error(msg)
+			return msg
+		}
+
 		csiSource := pv.Spec.CSI
-		if csiSource != nil && (csiSource.Driver == vSphereCSIDriverName && c.checkForDatastore(*csiSource)) {
-
+		if csiSource != nil && csiSource.Driver == vSphereCSIDriverName {
+			if c.checkForDatastore(csiSource) {
+				// c.migrateVolume(ctx, csiSource.VolumeHandle)
+				klog.Infof("We are going to migrate a volume %s", csiSource.VolumeHandle)
+			}
+		} else {
+			klog.Infof("pv %s is not of expected type", pvName)
 		}
 	}
-	return nil, nil
+	return nil
 }
 
-func (c *CNSVolumeMigrator) checkForDatastore(csiSource v1.CSIPersistentVolumeSource) bool {
-	return true
+func (c *CNSVolumeMigrator) migrateVolume(ctx context.Context, volumeID string) error {
+	dtsDatastore, err := c.getDatastore(ctx, c.destinationDatastore)
+	if err != nil {
+		msg := fmt.Errorf("error finding destinationd datastore %s: %v", dtsDatastore, err)
+		klog.Error(msg)
+		return msg
+	}
+
+	relocatedSpec := types.NewCnsBlockVolumeRelocateSpec(volumeID, dtsDatastore.Reference())
+	task, err := c.vSphereConnection.CnsClient().RelocateVolume(ctx, relocatedSpec)
+	if err != nil {
+		// Handle case when target DS is same as source DS, i.e. volume has
+		// already relocated.
+		if soap.IsSoapFault(err) {
+			soapFault := soap.ToSoapFault(err)
+			klog.Errorf("type of fault: %v. SoapFault Info: %v", reflect.TypeOf(soapFault.VimFault()), soapFault)
+			_, isAlreadyExistErr := soapFault.VimFault().(vim.AlreadyExists)
+			if isAlreadyExistErr {
+				// Volume already exists in the target SP, hence return success.
+				return nil
+			}
+		}
+		return err
+	}
+	taskInfo, err := task.WaitForResult(ctx)
+	if err != nil {
+		msg := fmt.Errorf("error waiting for relocation task: %v", err)
+		klog.Error(msg)
+		return msg
+	}
+	results := taskInfo.Result.(types.CnsVolumeOperationBatchResult)
+	for _, result := range results.VolumeResults {
+		fault := result.GetCnsVolumeOperationResult().Fault
+		if fault != nil {
+			klog.Errorf("Fault: %+v encountered while relocating volume %v", fault, volumeID)
+			return fmt.Errorf(fault.LocalizedMessage)
+		}
+	}
+	return nil
+}
+
+func (c *CNSVolumeMigrator) checkForDatastore(csiSource *v1.CSIPersistentVolumeSource) bool {
+	for _, cnsVolume := range c.matchingCnsVolumes {
+		vh := csiSource.VolumeHandle
+		if cnsVolume.VolumeId.Id == vh {
+			klog.Infof("found a volume to migrate: %s", vh)
+			podName, pvcName, inUseFlag := c.usedVolumeCache.volumeInUse(volumeHandle(vh))
+			if inUseFlag {
+				klog.Infof("volume %s is being used by pod %s in pvc %s", vh, podName, pvcName)
+				return false
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func (c *CNSVolumeMigrator) getCNSVolumes(ctx context.Context, dsName string) error {
