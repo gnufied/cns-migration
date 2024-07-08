@@ -9,6 +9,7 @@ import (
 
 	"github.com/vmware/govmomi/cns"
 	"github.com/vmware/govmomi/vapi/rest"
+	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/soap"
 	"k8s.io/legacy-cloud-providers/vsphere"
 
@@ -113,6 +114,16 @@ func (connection *VSphereConnection) NewClient(ctx context.Context) error {
 	}
 	connection.cnsClient = cnsClient
 	return nil
+}
+
+func (connection *VSphereConnection) VimClient() *vim25.Client {
+	return connection.Client.Client
+}
+
+// Return default datacenter configured in Config
+// TODO: Do we need to setup and handle multiple datacenters?
+func (connection *VSphereConnection) DefaultDatacenter() string {
+	return connection.Config.Workspace.Datacenter
 }
 
 func (connection *VSphereConnection) CnsClient() *cns.Client {
