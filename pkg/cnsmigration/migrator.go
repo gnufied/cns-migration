@@ -82,6 +82,8 @@ func (c *CNSVolumeMigrator) StartMigration(ctx context.Context, volumeFile strin
 		return err
 	}
 
+	klog.Infof("logging successfully to vcenter")
+
 	err = c.getCNSVolumes(ctx, c.sourceDatastore)
 	if err != nil {
 		klog.Errorf("error listing cns volumes: %v", err)
@@ -128,6 +130,7 @@ func (c *CNSVolumeMigrator) findCSIVolumes(ctx context.Context, volumeFile strin
 		if pvName == "" {
 			continue
 		}
+		klog.Infof("Starting migration for pv %s", pvName)
 		pv, err := c.clientSet.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
 		if err != nil {
 			msg := fmt.Errorf("error finding pv %s: %v", pvName, err)
@@ -137,9 +140,13 @@ func (c *CNSVolumeMigrator) findCSIVolumes(ctx context.Context, volumeFile strin
 
 		csiSource := pv.Spec.CSI
 		if csiSource != nil && csiSource.Driver == vSphereCSIDriverName {
-			if c.checkForDatastore(csiSource) {
-				// c.migrateVolume(ctx, csiSource.VolumeHandle)
-				klog.Infof("We are going to migrate a volume %s", csiSource.VolumeHandle)
+			if c.checkForDatastore(pv) {
+				err = c.migrateVolume(ctx, csiSource.VolumeHandle)
+				if err != nil {
+					klog.Errorf("error migrating volume %s with error: %v", pvName, err)
+				} else {
+					klog.Infof("successfully migrated pv %s with volumeID: %s", pvName, csiSource.VolumeHandle)
+				}
 			}
 		} else {
 			klog.Infof("pv %s is not of expected type", pvName)
@@ -172,7 +179,7 @@ func (c *CNSVolumeMigrator) migrateVolume(ctx context.Context, volumeID string) 
 		}
 		return err
 	}
-	taskInfo, err := task.WaitForResult(ctx)
+	taskInfo, err := task.WaitForResultEx(ctx)
 	if err != nil {
 		msg := fmt.Errorf("error waiting for relocation task: %v", err)
 		klog.Error(msg)
@@ -189,12 +196,13 @@ func (c *CNSVolumeMigrator) migrateVolume(ctx context.Context, volumeID string) 
 	return nil
 }
 
-func (c *CNSVolumeMigrator) checkForDatastore(csiSource *v1.CSIPersistentVolumeSource) bool {
+func (c *CNSVolumeMigrator) checkForDatastore(pv *v1.PersistentVolume) bool {
+	csiSource := pv.Spec.CSI
 	for _, cnsVolume := range c.matchingCnsVolumes {
 		vh := csiSource.VolumeHandle
 		if cnsVolume.VolumeId.Id == vh {
 			klog.Infof("found a volume to migrate: %s", vh)
-			podName, pvcName, inUseFlag := c.usedVolumeCache.volumeInUse(volumeHandle(vh))
+			pvcName, podName, inUseFlag := c.usedVolumeCache.volumeInUse(volumeHandle(vh))
 			if inUseFlag {
 				klog.Infof("volume %s is being used by pod %s in pvc %s", vh, podName, pvcName)
 				return false
@@ -202,6 +210,7 @@ func (c *CNSVolumeMigrator) checkForDatastore(csiSource *v1.CSIPersistentVolumeS
 			return true
 		}
 	}
+	klog.Infof("Unable to find volume %s in CNS datastore %s", pv.Name, c.sourceDatastore)
 	return false
 }
 
@@ -283,5 +292,10 @@ func (c *CNSVolumeMigrator) loginToVCenter(ctx context.Context) error {
 	}
 	vs := vclib.NewVSphereConnection(string(username), string(password), cfg)
 	c.vSphereConnection = vs
+
+	if err = c.vSphereConnection.Connect(ctx); err != nil {
+		return fmt.Errorf("error connecting to vcenter: %v", err)
+	}
+
 	return nil
 }

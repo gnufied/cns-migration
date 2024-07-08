@@ -161,5 +161,5 @@ func isPodTerminated(pod v1.Pod) bool {
 }
 
 func makeUniqueName(obj *v1.ObjectReference) string {
-	return obj.Name + "/" + obj.Namespace
+	return obj.Namespace + "/" + obj.Name
 }
