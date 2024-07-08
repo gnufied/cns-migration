@@ -1,6 +1,6 @@
-= Migrate CNS volumes between datastores
+# Migrate CNS volumes between datastores
 
-== How to use it:
+## How to use it:
 
 ```
 ./bin/cns-migration --source samsung-nvme --destination nfs-shared -volume-file ./pv.txt
